@@ -1,0 +1,9 @@
+
+# Simulatore OLED: file generati
+firmware/tools/oled_sim/sim
+firmware/tools/oled_sim/frames.jsonl
+firmware/tools/oled_sim/ble.log
+firmware/tools/oled_sim/anteprima_oled.png
+
+# Copie locali di materiale con copyright (manuali Takara Tomy ecc.): NON committare
+docs/reference/
