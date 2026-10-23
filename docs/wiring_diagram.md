@@ -1,5 +1,9 @@
 # Schema di Collegamento Elettrico (Wiring Diagram)
-**Versione Hardware:** v4 (XIAO ESP32-C3 + OLED + Batteria 802540)
+**Versione Hardware:** XIAO ESP32-C3 + OLED + Batteria 802540
+
+> ⚠️ **Gli schemi PNG originali (saldatura e posizionamento) sono obsoleti** e stanno in `archive/docs_v3/`: il pinout della XIAO
+> è disegnato al contrario e la batteria riportata è la 502030. **Vale solo la tabella qui sotto** (coincide col firmware).
+> I nuovi schemi andranno rifatti insieme al nuovo case.
 
 Questo documento illustra come collegare tutti i componenti per il Battle Pass DIY. Tutti i pin citati si riferiscono al microcontrollore **Seeed Studio XIAO ESP32-C3**.
 
@@ -29,9 +33,9 @@ Tutta la logica opera a **3.3V**. Utilizza il pad `3V3` della XIAO per alimentar
 
 ## 2. Schema di Saldatura (Visuale)
 
-Ecco lo schema di saldatura di riferimento per la versione v4. Notare come batteria vada saldata nei due pad posteriori della scheda XIAO. Si consiglia di usare fili **AWG 30** flessibili.
+La batteria va saldata nei due pad posteriori (BAT+/BAT-) della scheda XIAO, passando per lo slide switch sul positivo. Si consiglia di usare fili **AWG 30** flessibili.
 
-![Schema Saldatura](schema_saldatura_v4.png)
+*(schema PNG obsoleto, vedi avviso in alto — da rifare)*
 
 ### Consigli per la Saldatura
 1. **Interruttore a Scorrimento (Slide Switch)**: Taglia a metà il cavo rosso (Positivo) della batteria. Salda la metà che proviene dalla batteria al pin **Centrale** dell'interruttore. Salda uno spezzone di cavo dal pin **Laterale** dell'interruttore al pad `BAT+` della XIAO. In questo modo interrompi fisicamente l'energia.
@@ -43,9 +47,9 @@ Ecco lo schema di saldatura di riferimento per la versione v4. Notare come batte
 
 ## 3. Schema di Posizionamento nel Modello 3D
 
-Una volta saldati i componenti, andranno alloggiati all'interno dell'holster (il guscio stampato in 3D). Il modello v4 è progettato affinché tutto si incastri con precisione millimetrica.
+Una volta saldati i componenti, andranno alloggiati all'interno dell'holster (il guscio stampato in 3D). **Questa sezione si riferisce al case v4 (archiviato)**: il nuovo case cambierà layout e fori.
 
-![Schema Posizionamento](schema_posizionamento_v4.png)
+*(schema PNG obsoleto — da rifare col nuovo case)*
 
 1. **Batteria 802540**: Va infilata sul fondo della sezione posteriore. Grazie all'aumento a 8x25x40mm calzerà a pennello senza "ballare".
 2. **Scheda XIAO**: Va adagiata sopra la batteria. Assicurati che la porta USB-C sia rivolta verso la finestra `usb_slot_w` e a filo col retro del guscio.

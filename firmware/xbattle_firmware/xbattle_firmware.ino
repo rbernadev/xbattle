@@ -1,14 +1,14 @@
 /**
  * =============================================================================
- * XJUDGE — BATTLE PASS DIY FIRMWARE
+ * XBATTLE — BATTLE PASS DIY FIRMWARE  (v2: interfaccia OLED animata)
  * Hardware: Seeed Studio XIAO ESP32-C3
  * Sensore:  TCRT5000 (riflessione IR) collegato al pin D1
- * Display:  AZ-Delivery 0.91" OLED 128x32 I2C SSD1306 (opzionale, auto-detect)
+ * Display:  OLED 0.91" 128x32 I2C SSD1306 (opzionale, auto-detect)
  * Batteria: LiPo 3.7V 802540 (8x25x40mm) 550mAh — ricaricabile via USB-C
  *
- * PROTOCOLLO BLE (ASCII):
+ * PROTOCOLLO BLE (ASCII) — invariato rispetto alla v1:
  *   TX (Notify → App):
- *     "LIVE:<rpm>"       → RPM istantanei durante il lancio (streaming)
+ *     "LIVE:<rpm>"       → RPM durante il lancio (ora max ~25 al secondo)
  *     "RT:<rpm>"         → Picco massimo RPM a fine lancio
  *     "SYNC_COUNT:<n>"   → Quanti lanci offline ci sono in memoria
  *     "S:<rpm>"          → Singolo lancio offline (inviato in sequenza)
@@ -18,53 +18,60 @@
  *     "SYNC"             → L'app chiede i lanci offline salvati in NVS
  *     "CLEAR"            → L'app chiede di cancellare lo storage offline
  *
- * LOGICA PRINCIPALE (loop):
- *   1. Ogni impulso del sensore IR scatta un interrupt (IRAM_ATTR).
- *   2. Dall'intervallo tra due impulsi consecutivi si calcola l'RPM.
- *   3. Se non arrivano impulsi per 400ms → il lancio è finito.
- *   4. Il picco massimo ("RT:") viene inviato via BLE o salvato offline.
+ * NOVITA' DELLA v2:
+ *   - Display animato: boot, attesa con bey che gira, barra RPM live,
+ *     conteggio animato del risultato, lampo "NEW BEST", banner BLE, sync.
+ *   - Ultimo lancio e record restano salvati in NVS: dopo un riavvio il
+ *     display mostra ancora l'ultimo valore.
+ *   - Il display e l'I2C sono toccati SOLO dal loop() (prima anche dai callback
+ *     BLE, rischio di conflitti). I callback impostano solo dei flag.
+ *   - L'invio SYNC non blocca più lo stack BLE: parte dal loop() un lancio
+ *     ogni 60 ms.
+ *   - Gli impulsi del sensore finiscono in un buffer circolare e il loop li
+ *     legge tutti: niente impulsi persi mentre il display si ridisegna.
+ *     RPM = media mobile su 4 intervalli (riduce il rumore).
+ *   - LIVE limitato a ~25 messaggi al secondo.
+ *
+ * Compatibilità: arduino-esp32 2.0.x (l'API BLE della 3.x è diversa).
+ * Scheda: XIAO_ESP32C3, "USB CDC On Boot: Enabled". Libreria: U8g2.
  * =============================================================================
  */
 
 #include <Arduino.h>
-#include <Wire.h>           // I2C per il display OLED
-#include <U8g2lib.h>        // Libreria grafica per display SSD1306
-#include <BLEDevice.h>      // Stack BLE ESP32
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
-#include <BLE2902.h>        // Descrittore standard per le notifiche BLE (CCCD)
-#include <Preferences.h>    // NVS (Non-Volatile Storage): storage offline dei lanci
+#include <BLE2902.h>
+#include <Preferences.h>
+#include <math.h>
 
 
 // =============================================================================
 // PINOUT — XIAO ESP32-C3
-// Nota: la XIAO ha i pin etichettati D0-D10. Usiamo i macro Arduino (D1, D2…)
-// I2C è assegnato ai pin hardware nativi della scheda (GPIO6 e GPIO7).
 // =============================================================================
-#define OLED_SDA 6          // GPIO6  = D4 sulla XIAO ESP32-C3 (I2C SDA)
-#define OLED_SCL 7          // GPIO7  = D5 sulla XIAO ESP32-C3 (I2C SCL)
+#define OLED_SDA 6          // GPIO6  = D4 (I2C SDA)
+#define OLED_SCL 7          // GPIO7  = D5 (I2C SCL)
 
 #define SENSOR_PIN D1       // Segnale digitale dal TCRT5000 (INPUT_PULLUP)
-#define LED_BLE    D2       // LED blu: stato connessione BLE (solo senza display)
-#define LED_LAUNCH D3       // LED verde: in fase di lancio attivo (solo senza display)
-#define BUTTON_PIN D6       // Pulsante frontale tactile 6x6mm (INPUT_PULLUP, attivo LOW)
+#define LED_BLE    D2       // LED blu: stato BLE (solo senza display)
+#define LED_LAUNCH D3       // LED verde: lancio attivo (solo senza display)
+#define BUTTON_PIN D6       // Pulsante frontale (INPUT_PULLUP, attivo LOW)
 
 
 // =============================================================================
 // COSTANTI SENSORE E BLE
 // =============================================================================
+#define PULSES_PER_REV 6        // DA CALIBRARE per ogni lanciatore (String / Winder)
+#define DEBOUNCE_MICROS 250     // ~40.000 RPM di tetto teorico
+#define AVG_WINDOW 4            // intervalli mediati per calcolare l'RPM
+#define RING_SIZE 64            // capienza del buffer degli impulsi
+#define LIVE_INTERVAL_MS 40     // max ~25 notifiche LIVE al secondo
+#define MIN_VALID_RPM 1200      // sotto questa soglia il lancio è scartato
+#define MAX_VALID_RPM 40000.0f  // sopra è rumore elettrico
+#define GAUGE_FULL_RPM 20000.0f // fondoscala della barra sul display
 
-// Numero di lamelle/magneti che il sensore legge per ogni giro completo del beyblade.
-// Il TCRT5000 conta i passaggi delle alette del disco: 6 impulsi = 1 giro.
-#define PULSES_PER_REV 6
-
-// Tempo minimo in microsecondi tra due impulsi validi (filtro anti-rimbalzo hardware).
-// 250µs corrisponde a un tetto teorico di ~40.000 RPM, ben oltre i ~15.000 RPM reali.
-// Valori sotto questa soglia sono rumore elettrico e vengono scartati.
-#define DEBOUNCE_MICROS 250
-
-// UUID del servizio BLE custom e delle sue due caratteristiche.
-// Devono corrispondere ESATTAMENTE a quelli definiti in diy_battle_pass_provider.dart.
 #define SERVICE_UUID   "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHAR_TX_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // Notify (ESP32 → App)
 #define CHAR_RX_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // Write  (App → ESP32)
@@ -73,251 +80,432 @@
 // =============================================================================
 // OGGETTI GLOBALI
 // =============================================================================
-
-// Driver display OLED: inizializzato ma usato solo se hasDisplay == true.
-// U8G2_R0 = nessuna rotazione, U8X8_PIN_NONE = reset non collegato.
 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
-Preferences preferences;        // Storage NVS per i lanci offline
+Preferences preferences;    // lanci offline (namespace "bbx_offline")
+Preferences uiPrefs;        // ultimo lancio e record (namespace "bbx_ui")
 
-BLECharacteristic* pTxChar = NULL;  // Caratteristica TX (globale per accederla dal loop)
-bool deviceConnected = false;       // true se l'app è connessa via BLE
-bool hasDisplay     = false;        // true se l'OLED è stato rilevato su I2C 0x3C
+BLECharacteristic* pTxChar = NULL;
+volatile bool deviceConnected = false;
+bool hasDisplay = false;
 
-
-// =============================================================================
-// VARIABILI INTERRUPT (volatile = scritte dall'ISR, lette dal loop principale)
-// portMUX garantisce l'accesso atomico su ESP32 (dual-core)
-// =============================================================================
-volatile unsigned long lastPulseTime  = 0;  // Timestamp dell'ultimo impulso valido (µs)
-volatile unsigned long pulseInterval  = 0;  // Intervallo tra gli ultimi due impulsi (µs)
-volatile bool          newPulse       = false;  // Flag: c'è un nuovo impulso da processare?
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+// Flag impostati dai callback BLE e letti SOLO dal loop()
+volatile bool syncRequested = false;
 
 
 // =============================================================================
-// ISR — INTERRUPT SERVICE ROUTINE DEL SENSORE IR
-// Eseguita automaticamente ad ogni fronte di DISCESA sul pin SENSOR_PIN.
-// IRAM_ATTR = caricata in RAM interna per esecuzione veloce (non nella flash).
+// IMPULSI DEL SENSORE — buffer circolare riempito dall'ISR
+// (la C3 ha un solo core: per un produttore (ISR) e un consumatore (loop)
+//  con indici a 8 bit non serve un mutex)
 // =============================================================================
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long ringBuf[RING_SIZE];
+volatile uint8_t ringHead = 0;
+uint8_t ringTail = 0;
+
 void IRAM_ATTR handleSensorInterrupt() {
-  portENTER_CRITICAL_ISR(&mux);       // Sezione critica: disabilita interrupt locali
-
-  unsigned long currentTime = micros();
-  unsigned long interval = currentTime - lastPulseTime;
-
-  // Scarta impulsi troppo ravvicinati (rumore/rimbalzo hardware)
+  unsigned long now = micros();
+  unsigned long interval = now - lastPulseTime;
   if (interval > DEBOUNCE_MICROS) {
-    pulseInterval  = interval;        // Salva l'intervallo valido
-    lastPulseTime  = currentTime;     // Aggiorna il timestamp
-    newPulse       = true;            // Segnala al loop che c'è un dato nuovo
+    ringBuf[ringHead] = interval;
+    ringHead = (uint8_t)((ringHead + 1) % RING_SIZE);
+    lastPulseTime = now;
   }
-
-  portEXIT_CRITICAL_ISR(&mux);
 }
 
 
 // =============================================================================
-// DISPLAY OLED — updateDisplay()
-// Layout 128x32 pixel diviso in 3 zone:
-//   ┌────────────────────────────────┐  ← y=0
-//   │ STATUS (es. "BLE: CONNESSO")   │  ← y=7  (font 5x7)
-//   ├────────────────────────────────┤  ← y=9  (linea separatore)
-//   │ 12345  RPM      BATTLE PASS PRO│  ← y=24 (font grande + font piccolo)
-//   └────────────────────────────────┘  ← y=32
-// Se rpm == 0, al posto del numero viene mostrata la scritta "PRONTO".
+// STATO DEL LANCIO
 // =============================================================================
-void updateDisplay(String status, float rpm) {
-  if (!hasDisplay) return;   // Nessun display collegato: esci subito
+float maxRPM = 0.0;
+float liveRPM = 0.0;
+bool  isLaunching = false;
+unsigned long winBuf[AVG_WINDOW];
+uint8_t winIdx = 0, winCount = 0;
+unsigned long lastLiveMs = 0;
 
-  u8g2.clearBuffer();
 
-  // --- Riga 1: Status bar (angolo alto sx) ---
+// =============================================================================
+// STATO SYNC OFFLINE (macchina a stati eseguita dal loop)
+// =============================================================================
+bool syncActive = false;
+unsigned int syncCount = 0, syncIndex = 0;
+unsigned long lastSyncMs = 0;
+
+
+// =============================================================================
+// INTERFACCIA OLED
+//   BOOT   → logo che scorre + bey che accelera
+//   IDLE   → bey che gira piano + ULTIMO lancio (resta finché non ne fai un altro)
+//   LIVE   → bey veloce + barra RPM + valore in tempo reale
+//   RESULT → conteggio animato fino al picco, lampo, "NEW BEST!" se record
+//   SYNC   → barra di avanzamento del download offline
+// =============================================================================
+enum UiState { UI_BOOT, UI_IDLE, UI_LIVE, UI_RESULT, UI_SYNC };
+
+UiState uiState = UI_BOOT;
+unsigned long uiStateSince = 0;
+unsigned long uiLastFrame = 0;
+float uiAngle = 0.0f;
+
+float lastLaunchRPM = 0.0f;     // 0 = nessun lancio ancora
+float bestRPM = 0.0f;
+bool  lastWasOffline = false;
+bool  lastWasBest = false;
+bool  memFull = false;
+unsigned int sessionLaunches = 0;
+
+const char* bannerText = NULL;  // messaggio temporaneo nella riga alta
+unsigned long bannerUntil = 0;
+
+void uiSetState(UiState s) {
+  uiState = s;
+  uiStateSince = millis();
+}
+
+void uiBanner(const char* text, unsigned long ms) {
+  bannerText = text;
+  bannerUntil = millis() + ms;
+}
+
+float clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+float easeOutCubic(float t) { float u = 1.0f - clamp01(t); return 1.0f - u * u * u; }
+
+// Bey stilizzato: cerchio esterno, perno centrale, 3 pale che ruotano
+void drawBey(int cx, int cy, int r, float ang) {
+  u8g2.drawCircle(cx, cy, r);
+  u8g2.drawDisc(cx, cy, 2);
+  for (int k = 0; k < 3; k++) {
+    float a = ang + k * 2.0944f;                       // 120° tra le pale
+    int tx = cx + (int)lroundf(cosf(a + 0.45f) * (r - 1));
+    int ty = cy + (int)lroundf(sinf(a + 0.45f) * (r - 1));
+    int bx = cx + (int)lroundf(cosf(a + 1.45f) * (r * 0.45f));
+    int by = cy + (int)lroundf(sinf(a + 1.45f) * (r * 0.45f));
+    int cx2 = cx + (int)lroundf(cosf(a - 0.35f) * (r * 0.45f));
+    int cy2 = cy + (int)lroundf(sinf(a - 0.35f) * (r * 0.45f));
+    u8g2.drawTriangle(tx, ty, bx, by, cx2, cy2);
+  }
+}
+
+// Numero grande + "RPM" piccolo
+void drawRpmBig(float v, int x, int base) {
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%d", (int)(v + 0.5f));
+  u8g2.setFont(u8g2_font_profont22_tn);
+  u8g2.drawStr(x, base, buf);
+  int w = u8g2.getStrWidth(buf);
   u8g2.setFont(u8g2_font_5x7_tr);
-  u8g2.setCursor(0, 7);
-  u8g2.print(status);
+  u8g2.drawStr(x + w + 3, base, "RPM");
+}
 
-  // Linea orizzontale separatrice sotto la status bar
-  u8g2.drawHLine(0, 9, 128);
+// Indicatore BLE in alto a destra: "BT" in negativo = connesso, puntino lampeggiante = in attesa
+void drawBleIcon(unsigned long now) {
+  u8g2.setFont(u8g2_font_5x7_tr);
+  if (deviceConnected) {
+    u8g2.drawBox(114, 0, 14, 9);
+    u8g2.setDrawColor(0);
+    u8g2.drawStr(117, 7, "BT");
+    u8g2.setDrawColor(1);
+  } else if ((now / 500) % 2 == 0) {
+    u8g2.drawDisc(124, 4, 2);
+  }
+}
 
-  // --- Area centrale: RPM o "PRONTO" ---
-  u8g2.setFont(u8g2_font_profont22_tn);   // Font monospace grande per i numeri
-  if (rpm > 0) {
-    String rpmStr  = String(rpm, 0);      // Converti in intero (es. "14320")
-    int    rpmWidth = u8g2.getStrWidth(rpmStr.c_str());
-    u8g2.setCursor(2, 28);
-    u8g2.print(rpmStr);
+// Riga alta: banner temporaneo oppure l'etichetta indicata
+void drawTopLabel(const char* label, unsigned long now) {
+  u8g2.setFont(u8g2_font_5x7_tr);
+  if (bannerText != NULL && now < bannerUntil) u8g2.drawStr(32, 7, bannerText);
+  else u8g2.drawStr(32, 7, label);
+}
 
-    // Unità "RPM" in font piccolo, subito dopo il numero
-    u8g2.setFont(u8g2_font_5x7_tr);
-    u8g2.setCursor(2 + rpmWidth + 3, 28);
-    u8g2.print("RPM");
-  } else {
-    u8g2.setFont(u8g2_font_profont15_tr);
-    u8g2.setCursor(2, 26);
-    u8g2.print("PRONTO");
+void uiOnLaunchStart() {
+  liveRPM = 0.0f;
+  uiSetState(UI_LIVE);
+}
+
+void uiOnLaunchEnd(float peak, bool offline, bool full) {
+  lastLaunchRPM = peak;
+  lastWasOffline = offline;
+  memFull = full;
+  sessionLaunches++;
+  lastWasBest = peak > bestRPM;
+  if (lastWasBest) bestRPM = peak;
+  uiPrefs.begin("bbx_ui", false);
+  uiPrefs.putFloat("last", lastLaunchRPM);
+  uiPrefs.putFloat("best", bestRPM);
+  uiPrefs.end();
+  uiSetState(UI_RESULT);
+}
+
+void uiOnLaunchAbort() {
+  if (uiState == UI_LIVE) uiSetState(UI_IDLE);
+}
+
+void uiUpdate() {
+  if (!hasDisplay) return;
+  unsigned long now = millis();
+  unsigned long frameMs = (uiState == UI_LIVE) ? 33 : 50;   // ~30 fps live, ~20 fps altrove
+  if (now - uiLastFrame < frameMs) return;
+  float dt = (now - uiLastFrame) / 1000.0f;
+  if (dt > 0.1f) dt = 0.1f;
+  uiLastFrame = now;
+
+  // Banner a ogni cambio di connessione
+  static bool prevConn = false;
+  if (deviceConnected != prevConn) {
+    prevConn = deviceConnected;
+    uiBanner(deviceConnected ? "BLE CONNESSO" : "BLE SCOLLEGATO", 1500);
   }
 
-  // --- Angolo alto dx: label fissa del prodotto ---
-  u8g2.setFont(u8g2_font_5x7_tr);
-  const char* label  = "BATTLE PASS PRO";
-  int         labelW = u8g2.getStrWidth(label);
-  u8g2.setCursor(128 - labelW - 1, 7);   // Allineato a destra con 1px di margine
-  u8g2.print(label);
+  // Transizioni automatiche
+  if (uiState == UI_BOOT && now - uiStateSince > 1700) uiSetState(UI_IDLE);
+  if (uiState == UI_RESULT && now - uiStateSince > 4500) uiSetState(UI_IDLE);
+  if (syncActive && uiState != UI_SYNC) uiSetState(UI_SYNC);
+  if (!syncActive && uiState == UI_SYNC) uiSetState(UI_IDLE);
 
-  u8g2.sendBuffer();  // Invia il buffer al display fisico
+  float t = (now - uiStateSince) / 1000.0f;
+
+  // Velocità di rotazione dell'icona (rad/s): solo effetto visivo, non è l'RPM reale
+  float spin = 1.5f;
+  if (uiState == UI_BOOT)        spin = 2.0f + 16.0f * t;
+  else if (uiState == UI_LIVE)   spin = 3.0f + clamp01(liveRPM / GAUGE_FULL_RPM) * 28.0f;
+  else if (uiState == UI_RESULT) spin = 1.5f + 14.0f * expf(-2.0f * t);
+  else if (uiState == UI_SYNC)   spin = 5.0f;
+  uiAngle += spin * dt;
+  if (uiAngle > 6.2832f) uiAngle -= 6.2832f;
+
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  drawBey(14, 16, 12, uiAngle);
+
+  switch (uiState) {
+
+    case UI_BOOT: {
+      float x = 128.0f - (128.0f - 34.0f) * easeOutCubic(t / 0.6f);
+      u8g2.setFont(u8g2_font_profont15_tr);
+      u8g2.drawStr((int)x, 18, "XBATTLE");
+      if (t > 0.7f) {
+        u8g2.setFont(u8g2_font_5x7_tr);
+        u8g2.drawStr(34, 30, "BATTLE PASS PRO");
+      }
+      break;
+    }
+
+    case UI_IDLE: {
+      drawTopLabel(lastLaunchRPM > 0 ? "ULTIMO LANCIO" : "PRONTO AL LANCIO", now);
+      drawBleIcon(now);
+      if (lastLaunchRPM > 0) {
+        drawRpmBig(lastLaunchRPM, 32, 30);
+      } else {
+        u8g2.setFont(u8g2_font_profont15_tr);
+        u8g2.drawStr(32, 27, "LANCIA!");
+      }
+      break;
+    }
+
+    case UI_LIVE: {
+      // barra RPM in alto
+      u8g2.drawFrame(32, 0, 82, 7);
+      int fill = (int)(clamp01(liveRPM / GAUGE_FULL_RPM) * 78.0f);
+      if (fill > 0) u8g2.drawBox(34, 2, fill, 3);
+      drawBleIcon(now);
+      drawRpmBig(liveRPM, 32, 30);
+      break;
+    }
+
+    case UI_RESULT: {
+      float prog = clamp01(t / 0.7f);
+      float shown = lastLaunchRPM * easeOutCubic(prog);
+      const char* label = "LANCIO";
+      char lbl[16];
+      if (memFull) label = "MEMORIA PIENA";
+      else if (lastWasOffline) label = "SALVATO OFFLINE";
+      else { snprintf(lbl, sizeof(lbl), "LANCIO #%u", sessionLaunches); label = lbl; }
+      if (lastWasBest && t > 0.7f && t < 3.2f) {
+        // "NEW BEST!" lampeggiante
+        u8g2.setFont(u8g2_font_5x7_tr);
+        if ((now / 250) % 2 == 0) u8g2.drawStr(32, 7, "** NEW BEST! **");
+      } else {
+        drawTopLabel(label, now);
+      }
+      drawBleIcon(now);
+      drawRpmBig(shown, 32, 30);
+      // lampo in negativo nel momento in cui il conteggio arriva al picco
+      if (t >= 0.7f && t < 0.82f) {
+        u8g2.setDrawColor(2);
+        u8g2.drawBox(0, 0, 128, 32);
+        u8g2.setDrawColor(1);
+      }
+      break;
+    }
+
+    case UI_SYNC: {
+      u8g2.setFont(u8g2_font_5x7_tr);
+      u8g2.drawStr(32, 7, "SYNC OFFLINE");
+      u8g2.drawFrame(32, 12, 94, 8);
+      int fill = (syncCount == 0) ? 90 : (int)(90.0f * syncIndex / syncCount);
+      if (fill > 0) u8g2.drawBox(34, 14, fill, 4);
+      char buf[20];
+      snprintf(buf, sizeof(buf), "%u / %u", syncIndex, syncCount);
+      u8g2.setFont(u8g2_font_profont15_tr);
+      u8g2.drawStr(32, 31, buf);
+      break;
+    }
+  }
+
+  u8g2.sendBuffer();
 }
 
 
 // =============================================================================
 // NVS — saveOfflineLaunch()
-// Salva un lancio in memoria non volatile (NVS) quando il BLE non è connesso.
-// I lanci vengono indicizzati con chiavi "launch_0", "launch_1", ...
-// La chiave "count" tiene il conteggio totale.
-// Limite massimo: 500 lanci (FW-03: prevenzione overflow del contatore uint).
+// Ritorna true se il lancio è stato salvato, false se la memoria è piena.
+// Limite massimo: 500 lanci.
 // =============================================================================
-void saveOfflineLaunch(float rpm) {
-  preferences.begin("bbx_offline", false);  // false = read/write mode
-
+bool saveOfflineLaunch(float rpm) {
+  preferences.begin("bbx_offline", false);
   unsigned int count = preferences.getUInt("count", 0);
 
-  // Protezione overflow: se lo storage è pieno, scarta il lancio
   if (count >= 500) {
     preferences.end();
-    if (hasDisplay) updateDisplay("MEM PIENA!", rpm);
-    return;
+    return false;
   }
 
-  // Salva il lancio con chiave progressiva
   String key = "launch_" + String(count);
   preferences.putFloat(key.c_str(), rpm);
   preferences.putUInt("count", count + 1);
   preferences.end();
 
-  // Feedback visivo all'utente
-  if (hasDisplay) {
-    updateDisplay("SALVATO OFF", rpm);    // Display: mostra RPM + conferma
-  } else {
-    // LED: 2 lampeggi veloci del LED_LAUNCH come conferma
+  if (!hasDisplay) {
     for (int i = 0; i < 2; i++) {
       digitalWrite(LED_LAUNCH, LOW);  delay(100);
       digitalWrite(LED_LAUNCH, HIGH); delay(100);
     }
   }
+  return true;
 }
 
 
 // =============================================================================
-// CALLBACK BLE — Gestione connessione/disconnessione
-// Chiamate automaticamente dallo stack BLE quando l'app si connette o scollega.
+// CALLBACK BLE — NIENTE display e NIENTE delay qui dentro: solo flag
 // =============================================================================
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
-    if (!hasDisplay) digitalWrite(LED_BLE, HIGH);  // LED fisso = connesso
-    updateDisplay("BLE: CONNESSO", 0);
+    if (!hasDisplay) digitalWrite(LED_BLE, HIGH);
   }
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
-    if (!hasDisplay) digitalWrite(LED_BLE, LOW);   // LED spento = disconnesso
-    updateDisplay("BLE: ATTESA", 0);
-    BLEDevice::startAdvertising();  // Riprende l'advertising per nuove connessioni
+    if (!hasDisplay) digitalWrite(LED_BLE, LOW);
+    BLEDevice::startAdvertising();
   }
 };
 
-
-// =============================================================================
-// CALLBACK BLE — Gestione comandi in arrivo dall'app (caratteristica RX)
-// L'app scrive sulla caratteristica CHAR_RX_UUID per comandare l'ESP32.
-// =============================================================================
 class MyCommCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pChar) {
     std::string rxVal = pChar->getValue();
 
-    // --- Comando SYNC: l'app vuole scaricare i lanci offline ---
     if (rxVal == "SYNC") {
-      updateDisplay("SYNC IN CORSO", 0);
-
-      preferences.begin("bbx_offline", true);   // true = read-only mode
-      unsigned int count = preferences.getUInt("count", 0);
-
-      // 1. Informa l'app di quanti lanci stanno per arrivare
-      pTxChar->setValue(("SYNC_COUNT:" + String(count)).c_str());
-      pTxChar->notify();
-      delay(100);  // Piccola pausa per garantire la ricezione sul lato app
-
-      // 2. Invia ogni lancio salvato, uno alla volta (intervallo 60ms per BLE)
-      for (unsigned int i = 0; i < count; i++) {
-        String key    = "launch_" + String(i);
-        float  rpmVal = preferences.getFloat(key.c_str(), 0.0);
-        pTxChar->setValue(("S:" + String(rpmVal, 0)).c_str());
-        pTxChar->notify();
-        delay(60);   // Throttle BLE: evita di saturare il buffer del ricevitore
-      }
-      preferences.end();
-
-      // 3. Segnala la fine della trasmissione
-      pTxChar->setValue("SYNC_END");
-      pTxChar->notify();
-      updateDisplay("BLE: CONNESSO", 0);
+      syncRequested = true;                    // lo esegue il loop()
     }
-
-    // --- Comando CLEAR: l'app ha scaricato i dati e vuole svuotare lo storage ---
     else if (rxVal == "CLEAR") {
       preferences.begin("bbx_offline", false);
-      preferences.clear();                    // Cancella tutti i lanci
-      preferences.putUInt("count", 0);        // Azzera il contatore
+      preferences.clear();
+      preferences.putUInt("count", 0);
       preferences.end();
-      // Nessun feedback visivo: l'azione è silente per design
     }
   }
 };
 
 
 // =============================================================================
-// SETUP — Inizializzazione al boot
+// SYNC OFFLINE — macchina a stati, un messaggio ogni 60 ms, chiamata dal loop()
+// =============================================================================
+void syncStep() {
+  // Un SYNC già in corso viene interrotto se l'app si scollega
+  if (syncActive && !deviceConnected) {
+    preferences.end();
+    syncActive = false;
+    return;
+  }
+
+  if (syncRequested && !syncActive && deviceConnected) {
+    syncRequested = false;
+    preferences.begin("bbx_offline", true);
+    syncCount = preferences.getUInt("count", 0);
+    syncIndex = 0;
+    pTxChar->setValue(("SYNC_COUNT:" + String(syncCount)).c_str());
+    pTxChar->notify();
+    syncActive = true;
+    lastSyncMs = millis() + 40;                // totale ~100 ms prima del primo lancio
+    return;
+  }
+  syncRequested = false;
+
+  if (!syncActive) return;
+  if (millis() - lastSyncMs < 60) return;
+  lastSyncMs = millis();
+
+  if (syncIndex < syncCount) {
+    String key = "launch_" + String(syncIndex);
+    float rpmVal = preferences.getFloat(key.c_str(), 0.0);
+    pTxChar->setValue(("S:" + String(rpmVal, 0)).c_str());
+    pTxChar->notify();
+    syncIndex++;
+  } else {
+    pTxChar->setValue("SYNC_END");
+    pTxChar->notify();
+    preferences.end();
+    syncActive = false;
+  }
+}
+
+
+// =============================================================================
+// SETUP
 // =============================================================================
 void setup() {
-  Serial.begin(115200);   // Serial monitor per debug (opzionale in produzione)
+  Serial.begin(115200);
 
-  // --- Auto-detect display OLED su I2C (indirizzo standard SSD1306 = 0x3C) ---
+  // Auto-detect display OLED (indirizzo SSD1306 = 0x3C)
   Wire.begin(OLED_SDA, OLED_SCL);
   Wire.beginTransmission(0x3C);
   if (Wire.endTransmission() == 0) {
-    // ACK ricevuto: display presente
     hasDisplay = true;
     u8g2.begin();
-    updateDisplay("AVVIO...", 0);
+    u8g2.setBusClock(400000);                  // I2C veloce: ridisegno più rapido
+    uiSetState(UI_BOOT);
   } else {
-    // Nessun ACK: display assente, usa i LED come feedback
     hasDisplay = false;
     pinMode(LED_BLE, OUTPUT);
     pinMode(LED_LAUNCH, OUTPUT);
-    digitalWrite(LED_LAUNCH, HIGH);  // LED_LAUNCH acceso = in standby (logica invertita)
+    digitalWrite(LED_LAUNCH, HIGH);
   }
 
-  // --- Sensore IR: interrupt su fronte FALLING (passaggio lamella davanti al sensore) ---
+  // Ultimo lancio e record salvati
+  uiPrefs.begin("bbx_ui", true);
+  lastLaunchRPM = uiPrefs.getFloat("last", 0.0f);
+  bestRPM = uiPrefs.getFloat("best", 0.0f);
+  uiPrefs.end();
+
   pinMode(SENSOR_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), handleSensorInterrupt, FALLING);
 
-  // --- Pulsante frontale: tactile switch montato nel corpo 3D (active LOW) ---
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // --- Stack BLE: crea il server, il servizio e le due caratteristiche ---
-  BLEDevice::init("BBX_BattlePass_PRO");   // Nome device visibile durante la scansione
+  // Stack BLE
+  BLEDevice::init("BBX_BattlePass_PRO");
   BLEServer* pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService* pService = pServer->createService(SERVICE_UUID);
 
-  // TX: caratteristica che l'ESP32 usa per inviare notifiche all'app
   pTxChar = pService->createCharacteristic(
     CHAR_TX_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
   );
-  pTxChar->addDescriptor(new BLE2902());  // CCCD: necessario per attivare le notifiche
+  pTxChar->addDescriptor(new BLE2902());
 
-  // RX: caratteristica su cui l'app scrive i comandi (SYNC, CLEAR)
   BLECharacteristic* pRxChar = pService->createCharacteristic(
     CHAR_RX_UUID,
     BLECharacteristic::PROPERTY_WRITE
@@ -326,68 +514,101 @@ void setup() {
 
   pService->start();
   BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
-  BLEDevice::startAdvertising();   // Inizia ad annunciarsi come periferica BLE
-
-  updateDisplay("BLE: ATTESA", 0);
+  BLEDevice::startAdvertising();
 }
 
 
 // =============================================================================
-// VARIABILI DI STATO DEL LANCIO (dichiarate fuori dal loop per persistere)
+// PULSANTE FRONTALE — debounce software
 // =============================================================================
-float maxRPM     = 0.0;    // Picco RPM del lancio corrente
-bool  isLaunching = false;  // true dal primo impulso fino a 400ms di silenzio
-
-
-// =============================================================================
-// PULSANTE FRONTALE — Debounce software
-// Algoritmo standard a due stati: registra il cambio, poi aspetta BUTTON_DEBOUNCE_MS
-// prima di considerarlo stabile. Un secondo cooldown di 1s evita pressioni multiple.
-// =============================================================================
-bool          lastButtonState       = HIGH;
+bool          lastButtonState        = HIGH;
 unsigned long lastButtonChangeMillis = 0;
-const unsigned long BUTTON_DEBOUNCE_MS = 50;  // ms di stabilità richiesti
+const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 void checkButton() {
   bool currentState = digitalRead(BUTTON_PIN);
 
-  // Rileva cambio di stato (fronte) e salva il timestamp
   if (currentState != lastButtonState) {
     lastButtonChangeMillis = millis();
     lastButtonState = currentState;
   }
 
-  // Il pulsante è premuto (LOW) da abbastanza tempo → azione valida
   if (currentState == LOW && (millis() - lastButtonChangeMillis) > BUTTON_DEBOUNCE_MS) {
     static unsigned long lastActionMillis = 0;
 
-    // Cooldown 1 secondo tra un'azione e la successiva (evita trigger multipli)
     if (millis() - lastActionMillis > 1000) {
       lastActionMillis = millis();
 
       if (deviceConnected && pTxChar != NULL) {
-        // Invia "BTN_SYNC" all'app → l'app avvierà automaticamente la sincronizzazione
         pTxChar->setValue("BTN_SYNC");
         pTxChar->notify();
-        updateDisplay("SYNC (pulsante)", 0);
+        uiBanner("SYNC (PULSANTE)", 1500);
+      } else {
+        uiBanner("NON CONNESSO", 1500);
       }
-      // Se non connesso: il pulsante non fa nulla (il sync richiede BLE attivo)
     }
   }
 }
 
 
 // =============================================================================
-// LOOP PRINCIPALE — eseguito ~500 volte al secondo (delay(2) finale)
+// ELABORAZIONE IMPULSI — svuota il buffer circolare riempito dall'ISR
+// =============================================================================
+void processPulses() {
+  bool gotNew = false;
+
+  while (ringTail != ringHead) {
+    unsigned long interval = ringBuf[ringTail];
+    ringTail = (uint8_t)((ringTail + 1) % RING_SIZE);
+
+    if (!isLaunching) {
+      // Primo impulso: inizia il lancio. Il suo intervallo copre il tempo di
+      // inattività, quindi non è una misura valida e viene scartato.
+      isLaunching = true;
+      winIdx = 0;
+      winCount = 0;
+      maxRPM = 0.0f;
+      if (!hasDisplay) digitalWrite(LED_LAUNCH, LOW);
+      uiOnLaunchStart();
+      continue;
+    }
+
+    winBuf[winIdx] = interval;
+    winIdx = (uint8_t)((winIdx + 1) % AVG_WINDOW);
+    if (winCount < AVG_WINDOW) winCount++;
+    if (winCount < AVG_WINDOW) continue;       // finestra non ancora piena
+
+    unsigned long sum = 0;
+    for (uint8_t i = 0; i < AVG_WINDOW; i++) sum += winBuf[i];
+    float avgInterval = (float)sum / AVG_WINDOW;
+
+    // RPM = (60.000.000 µs / intervallo medio) / impulsi per giro
+    float rpm = (60000000.0f / avgInterval) / PULSES_PER_REV;
+
+    if (rpm < MAX_VALID_RPM) {
+      if (rpm > maxRPM) maxRPM = rpm;
+      liveRPM = rpm;
+      gotNew = true;
+    }
+  }
+
+  // Streaming live all'app, limitato a ~25 Hz
+  if (gotNew && deviceConnected && liveRPM > MIN_VALID_RPM &&
+      millis() - lastLiveMs >= LIVE_INTERVAL_MS) {
+    lastLiveMs = millis();
+    pTxChar->setValue(("LIVE:" + String(liveRPM, 0)).c_str());
+    pTxChar->notify();
+  }
+}
+
+
+// =============================================================================
+// LOOP PRINCIPALE
 // =============================================================================
 void loop() {
-  unsigned long currentMicros = micros();
-
-  // 1. Controlla il pulsante frontale ad ogni ciclo
   checkButton();
 
-  // 2. Blink LED BLE (solo senza display): lampeggio ogni 500ms con timer dedicato.
-  //    Usare millis() % 1000 causerebbe jitter al primo ciclo dopo il rollover.
+  // LED BLE lampeggiante (solo senza display)
   if (!deviceConnected && !hasDisplay) {
     static unsigned long _lastBlinkMs = 0;
     static bool          _ledState    = false;
@@ -398,58 +619,29 @@ void loop() {
     }
   }
 
-  // 3. Rilevamento FINE LANCIO: nessun impulso per 400ms continui
-  //    400ms è la finestra scelta perché i beyblade rallentano bruscamente a fine lancio.
-  if (currentMicros - lastPulseTime > 400000) {
-    if (isLaunching) {
-      // Soglia minima 1200 RPM: filtra i lanci abortiti o il rumore residuo
-      if (maxRPM > 1200) {
-        if (deviceConnected) {
-          // Invia il picco massimo all'app via BLE
-          pTxChar->setValue(("RT:" + String(maxRPM, 0)).c_str());
-          pTxChar->notify();
-          updateDisplay("LANCIO!", maxRPM);
-        } else {
-          // BLE non disponibile: salva il lancio offline in NVS
-          saveOfflineLaunch(maxRPM);
-        }
-      }
-      // Reset stato lancio
-      isLaunching = false;
-      maxRPM      = 0.0;
-      if (!hasDisplay) digitalWrite(LED_LAUNCH, HIGH);  // LED_LAUNCH torna in standby
-    }
-  }
+  syncStep();
+  processPulses();
 
-  // 4. Elaborazione NUOVO IMPULSO dal sensore (settato dall'ISR)
-  if (newPulse) {
-    // Leggi i dati volatili in sezione critica per evitare race condition con l'ISR
-    portENTER_CRITICAL(&mux);
-    unsigned long interval = pulseInterval;
-    newPulse = false;
-    portEXIT_CRITICAL(&mux);
-
-    // Primo impulso → il lancio è iniziato
-    isLaunching = true;
-    if (!hasDisplay) digitalWrite(LED_LAUNCH, LOW);  // LED_LAUNCH acceso durante lancio
-
-    // Formula RPM:
-    //   interval = microsecondi tra due impulsi consecutivi
-    //   60.000.000 µs = 1 minuto in microsecondi
-    //   / PULSES_PER_REV = converti da impulsi/min a giri/min
-    float currentRPM = (60000000.0 / interval) / PULSES_PER_REV;
-
-    // Scarta letture fisicamente impossibili (> 40.000 RPM = rumore elettrico)
-    if (currentRPM < 40000.0) {
-      if (currentRPM > maxRPM) maxRPM = currentRPM;  // Aggiorna il picco
-
-      // Streaming live all'app: invia ogni RPM valido sopra la soglia minima
-      if (deviceConnected && currentRPM > 1200) {
-        pTxChar->setValue(("LIVE:" + String(currentRPM, 0)).c_str());
+  // FINE LANCIO: nessun impulso per 400 ms
+  if (micros() - lastPulseTime > 400000 && isLaunching) {
+    if (maxRPM > MIN_VALID_RPM) {
+      bool offline = !deviceConnected;
+      bool full = false;
+      if (!offline) {
+        pTxChar->setValue(("RT:" + String(maxRPM, 0)).c_str());
         pTxChar->notify();
+      } else {
+        full = !saveOfflineLaunch(maxRPM);
       }
+      uiOnLaunchEnd(maxRPM, offline, full);
+    } else {
+      uiOnLaunchAbort();
     }
+    isLaunching = false;
+    maxRPM = 0.0f;
+    if (!hasDisplay) digitalWrite(LED_LAUNCH, HIGH);
   }
 
-  delay(2);  // ~2ms di pausa: bilancia reattività e consumo CPU
+  uiUpdate();
+  delay(2);
 }

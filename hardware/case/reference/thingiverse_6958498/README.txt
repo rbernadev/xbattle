@@ -1,0 +1,4 @@
+B.B.P. Launcher Level Holder by UrAvgIdiot on Thingiverse: https://www.thingiverse.com/thing:6958498
+
+Summary:
+A custom-designed accessory/tool that connects to ANY Beyblade X Launcher's Battle Pass Port. Includes the latches designed by Migbello and the main bullseye spirit level holder.Should be tournament legal since it doesn't affect performance, but as always, check with your event judge/referee!This print requires you to buy the bullseye spirit level seperately, link to the exact ones used here: https://www.amazon.com/Circular-Bullseye-Inclinometers-Phonograph-Turntable/dp/B07RKK22BF/ref=pd_ci_mcx_di_int_sccai_cn_d_sccl_2_1/146-9630438-8716137?pd_rd_w=dXMpJ&amp;content-id=amzn1.sym.751acc83-5c05-42d0-a15e-303622651e1e&amp;pf_rd_p=751acc83-5c05-42d0-a15e-303622651e1e&amp;pf_rd_r=BAT42P5DE6QYWH7EN823&amp;pd_rd_wg=xVgVi&amp;pd_rd_r=b6677b5d-1b29-4301-8143-4fc6061e0980&amp;pd_rd_i=B07RKK22BF&amp;psc=1
